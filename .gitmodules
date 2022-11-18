@@ -1,0 +1,3 @@
+[submodule "realtimeDDSP"]
+	path = realtimeDDSP
+	url = https://github.com/hyakuchiki/realtimeDDSP.git
