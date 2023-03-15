@@ -1,3 +1,10 @@
+# The classes in this file are extensions of synthesizer classes implemented
+# by Naotake Masuda in realtimeDDSP: https://github.com/hyakuchiki/realtimeDDSP
+
+# Functionality for extracting input harmonics and interpolation between input
+# and model-generated harmonics is added. Because torchscript currently does not
+# support super() calls, some of the original code is copied into the modified classes.
+
 import torch
 import torch.nn.functional as F
 import torchaudio
