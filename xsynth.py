@@ -3,7 +3,11 @@ import torch.nn.functional as F
 import torchaudio
 from typing import Dict, Tuple
 
-from diffsynth.stream import CachedStreamEstimatorFLSynth, StreamHarmonic, StreamFilteredNoise
+from diffsynth.stream import (
+    CachedStreamEstimatorFLSynth,
+    StreamHarmonic,
+    StreamFilteredNoise,
+)
 
 from diffsynth.f0 import yin_frame, FMIN, FMAX
 from diffsynth.spectral import spec_loudness, spectrogram
@@ -11,38 +15,6 @@ from diffsynth.spectral import spec_loudness, spectrogram
 import diffsynth.util as util
 import xsynth_utils
 
-class XSynthStreamFilteredNoise(StreamFilteredNoise):
-    def __init__(self, filter_size=257, name='noise', amplitude=1.0, batch_size=1):
-        super().__init__(filter_size, name, amplitude, batch_size)
-        self.param_sizes['input_noise'] = self.filter_size // 2 + 1
-        self.param_range['input_noise'] = (0.0, 1.0)
-        self.param_types['input_noise'] = 'raw'
-        self.param_sizes['noise_xsynth'] = 1
-        self.param_range['noise_xsynth'] = (0.0, 1.0)
-        self.param_types['noise_xsynth'] = "raw"
-
-    def forward(self, params: Dict[str, torch.Tensor], n_samples: int):
-        """generate Gaussian white noise through FIRfilter
-        Args:
-            freq_response (torch.Tensor): frequency response (only magnitude) [batch, n_frames, filter_size // 2 + 1]
-
-        Returns:
-            [torch.Tensor]: Filtered audio. Shape [batch, n_samples]
-        """
-        freq_response = params['freq_response']
-        batch_size = freq_response.shape[0]
-        # noise
-        audio = (torch.rand(batch_size, n_samples)*2.0-1.0).to(freq_response.device) * self.amplitude
-        
-        xsynth = params['noise_xsynth']
-        freq_response = freq_response * (1 - xsynth) + params['input_noise'] * 4 * xsynth
-        
-        filtered = util.fir_filter(audio, freq_response, self.filter_size, padding='valid')
-        output = filtered[..., :n_samples]
-        cache = F.pad(self.cache, pad=(0, n_samples-self.cache.shape[-1]))
-        output = output + cache
-        self.cache = filtered[..., n_samples:]
-        return output
 
 class XSynthStreamHarmonic(StreamHarmonic):
     def __init__(
@@ -92,6 +64,8 @@ class XSynthStreamHarmonic(StreamHarmonic):
             harmonic_distribution * (1 - xsynth) + input_harmonics * xsynth
         )
 
+        # copy synth code from StreamHarmonic since torchscript doesn't support super() function calls
+
         harmonic_amplitudes = amplitudes * harmonic_distribution
         # interpolate with previous params
         harmonic_frequencies = util.get_harmonic_frequencies(f0_hz, self.n_harmonics)
@@ -113,11 +87,19 @@ class XSynthStreamHarmonic(StreamHarmonic):
 
 class DDSPXSynth(CachedStreamEstimatorFLSynth):
     def __init__(
-        self, estimator, synth, sample_rate, hop_size=960, pitch_min=50., pitch_max=2000.
+        self,
+        estimator,
+        synth,
+        sample_rate,
+        hop_size=960,
+        pitch_min=50.0,
+        pitch_max=2000.0,
+        n_harmonics=256,
     ):
         super().__init__(estimator, synth, sample_rate, hop_size, pitch_min, pitch_max)
-        self.hann_win = torch.hann_window(2048, periodic=False)
-        self.prev_harm_freqs = torch.zeros(256)
+        self.hann_win = torch.hann_window(self.window_size, periodic=False)
+        self.prev_harm_freqs = torch.zeros(n_harmonics)
+        self.n_harmonics = n_harmonics
 
     def forward(
         self, audio: torch.Tensor, f0_mult: torch.Tensor, param: Dict[str, torch.Tensor]
@@ -159,50 +141,45 @@ class DDSPXSynth(CachedStreamEstimatorFLSynth):
             x.update(param)
             est_param = self.estimator(x)
 
-            # get input distribution
-            # for simplicity use same distribution for every timestep corresponding to
-            # current input buffer
-            input_spec = torch.abs(torch.fft.rfft(
-                torch.squeeze(orig_audio) * self.hann_win,
-                norm="forward"
-            ))
-            input_spec_db = 10 * torch.log10(input_spec + 1e-10)
-
-            peak_locs = xsynth_utils.detect_peaks(input_spec_db)
-            ipeak_locs, ipeak_mags = xsynth_utils.interpolate_peaks(
-                input_spec_db, peak_locs
+            # get spectrogram of input audio
+            # for simplicity we compute the harmonics for each input frame, not for each model frame
+            input_spec = torch.abs(
+                torch.fft.rfft(
+                    torch.squeeze(orig_audio) * self.hann_win, norm="forward"
+                )
             )
-            ipeak_freqs = self.sample_rate * ipeak_locs / 2048
 
+            # convert complex spectrogram to magnitudes in db
+            input_spec_db = 20 * torch.log10(input_spec + 1e-10)
+
+            f0_orig = self.prev_f0[-1]
+            f0_synth = f0[:, -1]
+
+            # get frequencies and magnitudes of input harmonics
             self.prev_harm_freqs, harm_mags = xsynth_utils.detect_harmonics(
-                ipeak_freqs,
-                ipeak_mags,
-                self.prev_f0[-1],
-                256,
+                input_spec_db,
+                f0_orig,
+                self.n_harmonics,
                 self.prev_harm_freqs,
                 self.sample_rate,
             )
 
-            ## convert back from dB to amplitude values
-            amp_env = 10 ** (harm_mags / 10)
-            x["input_distribution"] = amp_env
+            # get harmonic magnitudes for the harmonics of the synthesis f0
 
-            # generate audio from harmonics
-            amp_env = amp_env.repeat(orig_audio.numel(), 2)
-            freq_env = self.prev_harm_freqs.repeat(orig_audio.numel(), 2)
-            input_harm_audio = util.oscillator_bank(freq_env, amp_env, self.sample_rate)
-            
-            # spectrum of residual noise
-            res_spec = torch.abs(torch.fft.rfft(
-                torch.squeeze(orig_audio - input_harm_audio) * self.hann_win,
-                norm="forward"
-            ))
-            
-            harmonicity = (torch.sum(input_harm_audio ** 2) + 1e-10) / (torch.sum(orig_audio ** 2) + 1e-10)
-            
-            #res_spec = torchaudio.functional.resample(res_spec, 1025, 512 // 2 + 1, lowpass_filter_width=128)
-            res_spec = torchaudio.functional.resample(input_spec, 1025, 512 // 2 + 1, lowpass_filter_width=2)
-            x["input_noise"] = res_spec
+            input_dist = 10 ** (
+                xsynth_utils.interpolate_harmonics(
+                    self.prev_harm_freqs,
+                    harm_mags,
+                    f0_synth,
+                    self.sample_rate,
+                    param["formant"],
+                )
+                / 20
+            )
+            input_dist[
+                torch.arange(1, self.n_harmonics + 1) * f0_synth > self.sample_rate / 2
+            ] = 0
+            x["input_distribution"] = input_dist
 
             params_dict = self.synth.fill_params(est_param, x)
             render_length = (

@@ -1,79 +1,78 @@
+import sms_utils
 import torch
 
-# mostly copied code from
-# https://github.com/MTG/sms-tools/blob/master/software/models/
-# replaced np calls with torch calls
-# removed phase calculations, not needed for this application
+
+def detect_harmonics(spec_db, f0, n_harmonics: int, prev_harm_freqs, sample_rate: int):
+    peak_locs = sms_utils.detect_peaks(spec_db)
+    ipeak_locs, ipeak_mags = sms_utils.interpolate_peaks(spec_db, peak_locs)
+    nfft = (spec_db.numel() - 1) * 2
+    ipeak_freqs = sample_rate * ipeak_locs / nfft
+
+    return sms_utils.detect_harmonics(
+        ipeak_freqs,
+        ipeak_mags,
+        f0,
+        n_harmonics,
+        prev_harm_freqs,
+        sample_rate,
+    )
 
 
-def detect_peaks(mX, t=torch.tensor(-95., dtype=torch.float32)):
+def interpolate_harmonics(harm_freqs, harm_mags, f0_synth, sample_rate: int, formant):
     """
-    Detect spectral peak locations
-    mX: magnitude spectrum (dB), t: threshold
-    returns ploc: peak locations
-    """
+    Sample a given harmonic envelope at harmonics of a new fundamental frequency.
+    This allows for timbre-preserving (formant-preserving) pitch shifts.
+    Optional formant shift is applied by squashing or stretching the sampling intervals.
 
-    z = torch.zeros_like(mX[1:-1])
+    Args:
+        harm_freqs: frequencies of the detected harmonics in the input envelope
+        harm_mags: magnitudes of the detected harmonics in the input envelope
+        f0_synth: new fundamental frequency to sample the envelope at
+        sample_rate: sample rate of the audio
+        formant: formant shift factor (0.5 = no shift, 0 = full shift down, 1 = full shift up)
 
-    thresh = torch.where(
-        torch.greater(mX[1:-1], t), mX[1:-1], z
-    )  # locations above threshold
-    next_minor = torch.where(
-        mX[1:-1] > mX[2:], mX[1:-1], z
-    )  # locations higher than the next one
-    prev_minor = torch.where(
-        mX[1:-1] > mX[:-2], mX[1:-1], z
-    )  # locations higher than the previous one
-    ploc = thresh * next_minor * prev_minor  # locations fulfilling the three criteria
-    ploc = ploc.nonzero()[:, 0] + 1  # add 1 to compensate for previous steps
-    return ploc
-
-
-def interpolate_peaks(mX, ploc):
-    """
-    Interpolate peak values using parabolic interpolation
-    mX: magnitude spectrum, ploc: locations of peaks
-    returns iploc, ipmag: interpolated peak location and magnitude values
+    Returns:
+        synth_harm_mags: harmonic envelope to be used for additive synthesis
     """
 
-    val = mX[ploc]  # magnitude of peak bin
-    lval = mX[ploc - 1]  # magnitude of bin at left
-    rval = mX[ploc + 1]  # magnitude of bin at right
-    iploc = ploc + 0.5 * (lval - rval) / (lval - 2 * val + rval)  # center of parabola
-    ipmag = val - 0.25 * (lval - rval) * (iploc - ploc)  # magnitude of peaks
-    return iploc, ipmag
+    n_harmonics = harm_freqs.numel()
 
+    present_harmonics = harm_freqs > 0
 
-def detect_harmonics(pfreq: torch.Tensor, pmag: torch.Tensor, f0: torch.Tensor, nH: int, hfreqp: torch.Tensor, fs: int, harmDevSlope=torch.tensor(0.01, dtype=torch.float32)):
-    """
-    Detection of the harmonics of a frame from a set of spectral peaks using f0
-    to the ideal harmonic series built on top of a fundamental frequency
-    pfreq, pmag: peak frequencies and magnitude
-    f0: fundamental frequency, nH: number of harmonics,
-    hfreqp: harmonic frequencies of previous frame,
-    fs: sampling rate; harmDevSlope: slope of change of the deviation allowed to perfect harmonic
-    returns hfreq, hmag: harmonic frequencies and magnitudes
-    """
+    if not present_harmonics.any():
+        return torch.ones(n_harmonics) * -100
 
-    if f0 <= 0:  # if no f0 return no harmonics
-        return torch.zeros(nH), torch.zeros(nH)
-    hfreq = torch.zeros(nH)  # initialize harmonic frequencies
-    hmag = torch.zeros(nH) - 100  # initialize harmonic magnitudes
-    hf = f0 * torch.arange(1, nH + 1)  # initialize harmonic frequencies
-    hi = 0  # initialize harmonic index
-    if hfreqp.nonzero().numel() == 0:  # if no incomming harmonic tracks initialize to harmonic series
-        hfreqp = hf
-    while pfreq.numel() > 0 and (f0 > 0) and (hi < nH) and (hf[hi] < fs / 2):  # find harmonic peaks
-        pei = torch.argmin(abs(pfreq - hf[hi]))  # closest peak
-        dev1 = abs(pfreq[pei] - hf[hi])  # deviation from perfect harmonic
-        dev2 = (
-            abs(pfreq[pei] - hfreqp[hi]) if hfreqp[hi] > 0 else torch.tensor(fs, dtype=torch.float32)
-        )  # deviation from previous frame
-        threshold = f0 / 3 + harmDevSlope * pfreq[pei]
-        if (dev1 < threshold) or (
-            dev2 < threshold
-        ):  # accept peak if deviation is small
-            hfreq[hi] = pfreq[pei]  # harmonic frequencies
-            hmag[hi] = pmag[pei]  # harmonic magnitudes
-        hi += 1  # increase harmonic index
-    return hfreq, hmag
+    harm_freqs = harm_freqs[present_harmonics]
+    harm_mags = harm_mags[present_harmonics]
+
+    # make sure harm_freqs are sorted, adjust harm_mags accordingly
+    sort_idx = torch.argsort(harm_freqs)
+    harm_freqs = harm_freqs[sort_idx]
+    harm_mags = harm_mags[sort_idx]
+
+    # insert a "pseudo-harmonic" at 0 Hz with magnitude -100 dB (silence) to make interpolation easier
+    harm_freqs = torch.cat([torch.zeros(1), harm_freqs])
+    harm_mags = torch.cat([torch.ones(1) * -100, harm_mags])
+
+    formant_shift = 2 ** -(formant * 2 - 1)
+    synth_harm_mags = torch.ones(n_harmonics) * -100
+    synth_harm_freqs = f0_synth * torch.arange(1, n_harmonics + 1) * formant_shift
+
+    # for each frequency in synth_harm_freqs, find the closest (higher) harmonic in harm_freqs
+    freq_idxs = torch.searchsorted(harm_freqs, synth_harm_freqs, right=True)
+
+    # discard frequencies that are higher than the highest harmonic in harm_freqs or higher than nyquist
+    valid_freqs = (freq_idxs < harm_freqs.numel()) & (
+        synth_harm_freqs < sample_rate / 2
+    )
+    valid_idxs = freq_idxs[valid_freqs]
+
+    # sample harm_mags with linear interpolation
+    alphas = (synth_harm_freqs[valid_freqs] - harm_freqs[valid_idxs - 1]) / (
+        harm_freqs[valid_idxs] - harm_freqs[valid_idxs - 1]
+    )
+    synth_harm_mags[valid_freqs] = harm_mags[valid_idxs - 1] + alphas * (
+        harm_mags[valid_idxs] - harm_mags[valid_idxs - 1]
+    )
+
+    return synth_harm_mags
