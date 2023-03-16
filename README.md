@@ -2,6 +2,8 @@
 
 [neutone](https://neutone.space/) models that perform a form of [cross-synthesis](https://ccrma.stanford.edu/~jos/sasp/Cross_Synthesis.html) between an input audio signal and the output of a DDSP timbre transfer model. The main use case is to alter the timbre of vocals while preserving the lyrics, but of course any creative "misuse" is encouraged.
 
+See [here](https://youtu.be/1xAAkqWc4cc) for a video demonstration.
+
 ## Using the Neutone Cross-Synthesis Models
 
 1. Install the [neutone](https://neutone.space/) plugin.
